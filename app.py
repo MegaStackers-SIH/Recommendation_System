@@ -6,6 +6,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import json
 import random
 import time
+import os
 from datetime import datetime
 
 app = Flask(__name__)
@@ -744,4 +745,5 @@ def health_check():
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
