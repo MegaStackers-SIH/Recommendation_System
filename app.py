@@ -3,9 +3,30 @@ from flask_cors import CORS
 import pandas as pd
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+import json
+import random
+import time
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React frontend
+
+# Custom JSON encoder to handle numpy/pandas data types
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+        elif pd.isna(obj):
+            return None
+        return super(NumpyEncoder, self).default(obj)
+
+app.json_encoder = NumpyEncoder
 
 # Load data and embeddings once at startup
 try:
@@ -19,11 +40,40 @@ except FileNotFoundError as e:
     print("Ensure 'mock_data_field_specific_boolean_capped.csv', 'user_additional_info.csv' and 'embeddings.npy' are in the project directory")
     exit(1)
 
-def recommend_profiles(user_id, df, embeddings, top_k=5, min_sim=0.7):
+def convert_to_json_serializable(obj):
+    """Convert numpy/pandas data types to JSON serializable types"""
+    if isinstance(obj, dict):
+        return {key: convert_to_json_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_json_serializable(item) for item in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
+
+def recommend_profiles(user_id, df, embeddings, top_k=5, min_sim=0.7, diversify=True, random_seed=None, strategy='mixed'):
     """
     Recommend alumni profiles to both students and alumni based on cosine similarity.
     - Students: Recommend alumni.
     - Alumni: Recommend other alumni, excluding self.
+    
+    Args:
+        user_id: User ID to get recommendations for
+        df: User dataframe
+        embeddings: User embeddings
+        top_k: Number of recommendations to return
+        min_sim: Minimum similarity threshold
+        diversify: Whether to add diversity to recommendations
+        random_seed: Random seed for reproducible results (if None, uses current time)
+        strategy: Recommendation strategy ('mixed', 'similarity', 'random', 'fresh')
     """
     try:
         user_row = df[df["id"] == user_id]
@@ -49,15 +99,96 @@ def recommend_profiles(user_id, df, embeddings, top_k=5, min_sim=0.7):
         # Compute similarity
         sim_scores = cosine_similarity([embeddings[user_idx]], embeddings[candidates_idx]).flatten()
         
+        # Set random seed for consistent but time-varied results
+        if random_seed is None:
+            # Change recommendations every 5 seconds for dynamic behavior
+            random_seed = int(time.time() // 5) + user_id
+        np.random.seed(random_seed)
+        random.seed(random_seed)
+        
         # Filter by threshold
         valid_candidates = np.where(sim_scores >= min_sim)[0]
         if len(valid_candidates) == 0:
             print(f"Warning: No matches above {min_sim} for user {user_id}; using fallback")
             valid_candidates = np.arange(len(candidates_idx))
         
-        # Select top_k
-        sorted_valid = np.argsort(sim_scores[valid_candidates])[::-1][:min(top_k, len(valid_candidates))]
-        top_candidates_local_idx = valid_candidates[sorted_valid]
+        # Apply different recommendation strategies
+        if strategy == 'similarity':
+            # Pure similarity-based (deterministic)
+            sorted_valid = np.argsort(sim_scores[valid_candidates])[::-1][:min(top_k, len(valid_candidates))]
+            top_candidates_local_idx = valid_candidates[sorted_valid]
+            
+        elif strategy == 'random':
+            # Completely random from valid candidates
+            if len(valid_candidates) >= top_k:
+                random_picks = np.random.choice(valid_candidates, size=top_k, replace=False)
+            else:
+                random_picks = valid_candidates
+            top_candidates_local_idx = random_picks
+            
+        elif strategy == 'fresh':
+            # Focus on less similar but still relevant users for discovery
+            sorted_indices = np.argsort(sim_scores[valid_candidates])[::-1]
+            # Skip the most similar ones and pick from middle tier
+            start_idx = min(top_k, len(sorted_indices) // 4)
+            end_idx = min(len(sorted_indices), start_idx + top_k * 3)
+            fresh_pool = sorted_indices[start_idx:end_idx]
+            
+            if len(fresh_pool) >= top_k:
+                fresh_picks = np.random.choice(fresh_pool, size=top_k, replace=False)
+            else:
+                fresh_picks = fresh_pool
+            top_candidates_local_idx = valid_candidates[fresh_picks]
+            
+        elif strategy == 'mixed' and diversify and len(valid_candidates) > top_k:
+            # Enhanced mixed strategy for diversity (default)
+            sorted_indices = np.argsort(sim_scores[valid_candidates])[::-1]
+            
+            # Take top performers (60% of recommendations)
+            top_count = max(1, int(top_k * 0.6))
+            top_performers = sorted_indices[:min(top_count, len(sorted_indices))]
+            
+            # Take good performers with some randomness (40% of recommendations)
+            remaining_count = top_k - len(top_performers)
+            if remaining_count > 0:
+                # Select from next tier with weighted randomness
+                extended_pool_size = min(len(sorted_indices), max(top_k * 3, len(top_performers) + remaining_count * 2))
+                extended_pool = sorted_indices[len(top_performers):extended_pool_size]
+                
+                # Weighted selection - higher similarity = higher chance
+                if len(extended_pool) > 0:
+                    weights = sim_scores[valid_candidates[extended_pool]]
+                    weights = np.maximum(weights, 0.1)  # Ensure no zero weights
+                    
+                    # Randomly select from extended pool
+                    if len(extended_pool) >= remaining_count:
+                        diverse_picks = np.random.choice(
+                            extended_pool, 
+                            size=remaining_count, 
+                            replace=False, 
+                            p=weights/weights.sum()
+                        )
+                    else:
+                        diverse_picks = extended_pool
+                else:
+                    diverse_picks = []
+            else:
+                diverse_picks = []
+            
+            # Combine selections
+            if len(diverse_picks) > 0:
+                final_selection = np.concatenate([top_performers, diverse_picks])
+            else:
+                final_selection = top_performers
+            
+            # Shuffle the final results to add more variety
+            np.random.shuffle(final_selection)
+            top_candidates_local_idx = valid_candidates[final_selection[:top_k]]
+        else:
+            # Fallback to standard deterministic selection
+            sorted_valid = np.argsort(sim_scores[valid_candidates])[::-1][:min(top_k, len(valid_candidates))]
+            top_candidates_local_idx = valid_candidates[sorted_valid]
+        
         top_global_idx = candidates_idx[top_candidates_local_idx]
         
         # Prepare results
@@ -66,7 +197,9 @@ def recommend_profiles(user_id, df, embeddings, top_k=5, min_sim=0.7):
         results_df = df.loc[top_global_idx, available_cols].copy()
         results_df['similarity_score'] = sim_scores[top_candidates_local_idx]
         
-        return results_df.to_dict('records')
+        # Convert to dict and ensure JSON serializable types
+        results = results_df.to_dict('records')
+        return convert_to_json_serializable(results)
     
     except (IndexError, KeyError) as e:
         return {"error": f"Error processing user ID {user_id}: {str(e)}"}
@@ -93,7 +226,15 @@ def api_info():
             "recommendations": "/api/users/{id}/recommendations",
             "search": "/api/users/search",
             "analytics": "/api/analytics",
+            "recommendation_strategies": "/api/recommendations/strategies",
+            "time_debug": "/api/recommendations/time-debug",
             "documentation": "See API_DOCUMENTATION.md"
+        },
+        "recommendation_features": {
+            "dynamic_refresh": "every 5 seconds",
+            "strategies": ["mixed", "similarity", "random", "fresh"],
+            "time_based_variation": "automatic without seed parameter",
+            "current_time_window": int(time.time() // 5)
         }
     })
 
@@ -160,6 +301,8 @@ def get_user_by_id(user_id):
             }
         }
         
+        # Convert to JSON serializable format
+        structured_response = convert_to_json_serializable(structured_response)
         return jsonify(structured_response)
     
     except Exception as e:
@@ -225,7 +368,7 @@ def get_all_users():
                 "location": user_info.get('location', 'N/A')
             })
         
-        return jsonify({
+        response_data = {
             "users": users,
             "pagination": {
                 "page": page,
@@ -240,7 +383,9 @@ def get_all_users():
                 "major": major,
                 "is_mentor": is_mentor
             }
-        })
+        }
+        
+        return jsonify(convert_to_json_serializable(response_data))
     
     except Exception as e:
         return jsonify({"error": f"Error fetching users: {str(e)}"}), 500
@@ -284,11 +429,13 @@ def search_users():
         # Limit results
         search_results = search_results[:limit]
         
-        return jsonify({
+        response_data = {
             "query": query,
             "results_count": len(search_results),
             "results": search_results
-        })
+        }
+        
+        return jsonify(convert_to_json_serializable(response_data))
     
     except Exception as e:
         return jsonify({"error": f"Error searching users: {str(e)}"}), 500
@@ -303,13 +450,28 @@ def get_user_recommendations(user_id):
     try:
         top_k = request.args.get('top_k', 5, type=int)
         min_sim = request.args.get('min_sim', 0.7, type=float)
+        diversify = request.args.get('diversify', 'true').lower() in ['true', '1', 'yes']
+        seed = request.args.get('seed', type=int)  # Optional seed for reproducible results
+        strategy = request.args.get('strategy', 'mixed')  # mixed, similarity, random, fresh
         
         if top_k < 1 or top_k > 50:
             return jsonify({"error": "top_k must be between 1 and 50"}), 400
         if min_sim < 0 or min_sim > 1:
             return jsonify({"error": "min_sim must be between 0 and 1"}), 400
         
-        results = recommend_profiles(user_id, df, embeddings, top_k=top_k, min_sim=min_sim)
+        # Validate strategy parameter
+        valid_strategies = ['mixed', 'similarity', 'random', 'fresh']
+        if strategy not in valid_strategies:
+            return jsonify({"error": f"Invalid strategy. Must be one of: {valid_strategies}"}), 400
+        
+        results = recommend_profiles(
+            user_id, df, embeddings, 
+            top_k=top_k, 
+            min_sim=min_sim, 
+            diversify=diversify, 
+            random_seed=seed,
+            strategy=strategy
+        )
         
         if isinstance(results, dict) and "error" in results:
             return jsonify(results), 404
@@ -329,15 +491,27 @@ def get_user_recommendations(user_id):
             })
             enhanced_results.append(enhanced_result)
         
-        return jsonify({
+        response_data = {
             "user_id": user_id,
             "recommendations": enhanced_results,
             "parameters": {
                 "top_k": top_k,
-                "min_similarity_threshold": min_sim
+                "min_similarity_threshold": min_sim,
+                "diversify": diversify,
+                "seed_used": seed if seed else "time-based",
+                "strategy": strategy,
+                "recommendation_approach": strategy
             },
-            "count": len(enhanced_results)
-        })
+            "count": len(enhanced_results),
+            "timestamp": datetime.now().isoformat(),
+            "refresh_info": {
+                "recommendations_refresh": "every 5 seconds" if not seed else "static with seed",
+                "next_refresh_tip": "Remove 'seed' parameter or wait 5 seconds for different results",
+                "current_time_window": int(time.time() // 5)
+            }
+        }
+        
+        return jsonify(convert_to_json_serializable(response_data))
     
     except Exception as e:
         return jsonify({"error": f"Error getting recommendations: {str(e)}"}), 500
@@ -362,13 +536,77 @@ def get_batch_recommendations():
             results = recommend_profiles(user_id, df, embeddings, top_k=top_k, min_sim=min_sim)
             batch_results[str(user_id)] = results
         
-        return jsonify({
+        response_data = {
             "batch_recommendations": batch_results,
             "parameters": {"top_k": top_k, "min_sim": min_sim}
-        })
+        }
+        return jsonify(convert_to_json_serializable(response_data))
     
     except Exception as e:
         return jsonify({"error": f"Error processing batch recommendations: {str(e)}"}), 500
+
+@app.route('/api/recommendations/strategies', methods=['GET'])
+def get_recommendation_strategies():
+    """Get information about available recommendation strategies"""
+    strategies_info = {
+        "available_strategies": {
+            "mixed": {
+                "description": "Balanced approach combining top matches with diverse options",
+                "behavior": "60% top similar users + 40% diverse weighted random selection",
+                "best_for": "General discovery and networking",
+                "variety": "High"
+            },
+            "similarity": {
+                "description": "Pure similarity-based matching",
+                "behavior": "Returns most similar users in descending order",
+                "best_for": "Finding highly compatible matches",
+                "variety": "Low (deterministic)"
+            },
+            "random": {
+                "description": "Random selection from qualified candidates",
+                "behavior": "Random selection from users above similarity threshold", 
+                "best_for": "Exploring completely different profiles",
+                "variety": "Very High"
+            },
+            "fresh": {
+                "description": "Discovery-focused recommendations",
+                "behavior": "Avoids most similar users, focuses on middle-tier matches",
+                "best_for": "Finding new and unexpected connections",
+                "variety": "High"
+            }
+        },
+        "parameters": {
+            "strategy": "One of: mixed, similarity, random, fresh (default: mixed)",
+            "diversify": "Enable/disable diversification (default: true)",
+            "seed": "Optional integer for reproducible results",
+            "top_k": "Number of recommendations (1-50, default: 5)",
+            "min_sim": "Minimum similarity threshold (0-1, default: 0.7)"
+        },
+        "tips": {
+            "dynamic_results": "Remove 'seed' parameter for time-based variation (changes hourly)",
+            "static_results": "Use 'seed' parameter for consistent results across requests",
+            "variety": "Try different strategies: 'fresh' for discovery, 'mixed' for balance",
+            "quality": "Use 'similarity' for highest quality matches"
+        }
+    }
+    
+    return jsonify(strategies_info)
+
+@app.route('/api/recommendations/time-debug', methods=['GET'])
+def get_time_debug_info():
+    """Get current time window information for debugging dynamic recommendations"""
+    current_time = time.time()
+    time_window = int(current_time // 5)
+    
+    debug_info = {
+        "current_timestamp": current_time,
+        "current_datetime": datetime.now().isoformat(),
+        "time_window_5_sec": time_window,
+        "seconds_until_next_change": 5 - (current_time % 5),
+        "explanation": "Recommendations change every 5 seconds based on time_window_5_sec value"
+    }
+    
+    return jsonify(debug_info)
 
 # ============================================================================
 # ANALYTICS ROUTES
@@ -403,7 +641,7 @@ def get_analytics_overview():
         # Experience distribution
         experience_stats = df_user_info['years_experience'].describe().to_dict()
         
-        return jsonify({
+        analytics_data = {
             "user_statistics": {
                 "total_users": total_users,
                 "total_alumni": total_alumni,
@@ -421,7 +659,9 @@ def get_analytics_overview():
                 "experience_statistics": experience_stats
             },
             "graduation_year_stats": graduation_years
-        })
+        }
+        
+        return jsonify(convert_to_json_serializable(analytics_data))
     
     except Exception as e:
         return jsonify({"error": f"Error generating analytics: {str(e)}"}), 500
@@ -455,7 +695,7 @@ def get_major_analytics():
                 "top_companies": top_companies
             }
         
-        return jsonify({"major_analytics": major_analytics})
+        return jsonify(convert_to_json_serializable({"major_analytics": major_analytics}))
     
     except Exception as e:
         return jsonify({"error": f"Error generating major analytics: {str(e)}"}), 500
@@ -469,10 +709,10 @@ def get_all_majors():
     """Get list of all available majors"""
     try:
         majors = sorted(df['major'].unique().tolist())
-        return jsonify({
+        return jsonify(convert_to_json_serializable({
             "majors": majors,
             "count": len(majors)
-        })
+        }))
     except Exception as e:
         return jsonify({"error": f"Error fetching majors: {str(e)}"}), 500
 
@@ -481,17 +721,17 @@ def get_all_companies():
     """Get list of all companies"""
     try:
         companies = sorted(df_user_info['current_company'].unique().tolist())
-        return jsonify({
+        return jsonify(convert_to_json_serializable({
             "companies": companies,
             "count": len(companies)
-        })
+        }))
     except Exception as e:
         return jsonify({"error": f"Error fetching companies: {str(e)}"}), 500
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    return jsonify({
+    health_data = {
         "status": "healthy",
         "timestamp": pd.Timestamp.now().isoformat(),
         "data_loaded": {
@@ -499,7 +739,8 @@ def health_check():
             "user_info": len(df_user_info) > 0,
             "embeddings": embeddings is not None
         }
-    })
+    }
+    return jsonify(convert_to_json_serializable(health_data))
 
 
 if __name__ == '__main__':
